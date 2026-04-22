@@ -9,11 +9,10 @@ return new class extends Migration
     /**
      * Run the migrations.
      */
-   public function up(): void
+public function up(): void
 {
-    Schema::table('vendors', function (Blueprint $table) {
-        $table->string('pan')->nullable();
-    });
+    // pan_number is already added in create_vendors_table migration
+    // this migration is now intentionally empty
 }
 
     /**

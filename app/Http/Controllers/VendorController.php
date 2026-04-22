@@ -2,215 +2,199 @@
 
 namespace App\Http\Controllers;
 
-use Illuminate\Support\Facades\DB;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Crypt;
 use App\Models\Vendor;
+use App\Models\VendorStatusLog;
+use App\Http\Requests\StoreVendorRequest;
+use App\Http\Requests\UpdateVendorRequest;
+use App\Services\StatusTransitionService;
 
 class VendorController extends Controller
 {
+    // -------------------------------------------------------
+    // List — search by business_name, pan_number, status
+    // -------------------------------------------------------
+
     public function index(Request $request)
     {
-        $query = Vendor::with('latestStatusLog');
+        $query = Vendor::with('user', 'latestStatusLog');
 
-        // SEARCH (name OR PAN)
         if ($request->filled('search')) {
             $search = $request->search;
-
             $query->where(function ($q) use ($search) {
-                $q->where('name', 'like', "%{$search}%")
-                  ->orWhere('pan', 'like', "%{$search}%");
+                $q->where('business_name', 'like', "%{$search}%")
+                  ->orWhere('pan_number',   'like', "%{$search}%");
             });
         }
 
-        // STATUS FILTER
         if ($request->filled('status')) {
             $query->where('status', $request->status);
         }
 
-        $vendors = $query->get();
+        $vendors = $query->latest()->get();
 
         return view('vendors.index', compact('vendors'));
     }
+
+    // -------------------------------------------------------
+    // Create
+    // -------------------------------------------------------
 
     public function create()
     {
         return view('vendors.create');
     }
 
-    public function store(Request $request)
+    public function store(StoreVendorRequest $request)
     {
-        $request->validate([
-            'name' => 'required',
-            'email' => 'required|email|unique:vendors,email',
-            'phone' => 'required|digits:10',
-            'pan' => 'required|regex:/^[A-Z]{5}[0-9]{4}[A-Z]{1}$/'
-        ]);
+        $data = $request->validated();
 
-        Vendor::create([
-            'name' => $request->name,
-            'email' => $request->email,
-            'phone' => $request->phone,
-            'address' => $request->address,
-            'pan' => $request->pan,
-            'user_id' => auth()->id(),
-            'status' => 'draft',
-        ]);
+        // Encrypt bank account — never store plain text
+        $data['account_number_encrypted'] = Crypt::encryptString($data['account_number']);
+        unset($data['account_number']);
+
+        $data['user_id'] = auth()->id();
+        $data['status']  = 'draft';
+
+        $vendor = Vendor::create($data);
+
+        $this->logStatus($vendor, null, 'draft', 'Application created');
 
         return redirect()->route('vendors.index')
-            ->with('success', 'Vendor created successfully');
+            ->with('success', 'Vendor application created.');
     }
 
-    public function edit($id)
-    {
-        $vendor = Vendor::findOrFail($id);
+    // -------------------------------------------------------
+    // Edit — only creator, only draft/sent_back
+    // -------------------------------------------------------
 
-        if ($vendor->user_id != auth()->id()) {
-            return back()->with('error', 'Unauthorized');
-        }
+    public function edit(Vendor $vendor)
+    {
+        $this->assertCreator($vendor);
+        $this->assertEditableStatus($vendor);
 
         return view('vendors.edit', compact('vendor'));
     }
 
-    public function update(Request $request, $id)
+    public function update(UpdateVendorRequest $request, Vendor $vendor)
     {
-        $request->validate([
-            'name' => 'required',
-            'email' => 'required|email|unique:vendors,email,' . $id,
-            'phone' => 'required|digits:10',
-            'pan' => 'required|regex:/^[A-Z]{5}[0-9]{4}[A-Z]{1}$/'
-        ]);
+        $this->assertCreator($vendor);
+        $this->assertEditableStatus($vendor);
 
-        $vendor = Vendor::findOrFail($id);
+        $data = $request->validated();
 
-        if ($vendor->user_id != auth()->id()) {
-            return back()->with('error', 'Unauthorized');
-        }
+        // Re-encrypt if account number was changed
+        $data['account_number_encrypted'] = Crypt::encryptString($data['account_number']);
+        unset($data['account_number']);
 
-        $vendor->update($request->all());
+        $vendor->update($data);
 
-        return redirect()->route('vendors.index')
-            ->with('success', 'Vendor updated successfully');
+        return redirect()->route('vendors.show', $vendor)
+            ->with('success', 'Application updated.');
     }
 
-    public function destroy($id)
+    // -------------------------------------------------------
+    // Show
+    // -------------------------------------------------------
+
+    public function show(Vendor $vendor)
     {
-        $vendor = Vendor::findOrFail($id);
-
-        if ($vendor->user_id != auth()->id()) {
-            return back()->with('error', 'Unauthorized');
-        }
-
-        $vendor->delete();
-
-        return redirect()->route('vendors.index')
-            ->with('success', 'Vendor deleted successfully');
+        $vendor->load('statusLogs.user');
+        return view('vendors.show', compact('vendor'));
     }
 
-    public function submit($id)
+    // -------------------------------------------------------
+    // Submit (creator only, draft/sent_back → submitted)
+    // -------------------------------------------------------
+
+    public function submit(Vendor $vendor)
     {
-        $vendor = Vendor::findOrFail($id);
+        $this->assertCreator($vendor);
+        StatusTransitionService::assertAllowed($vendor->status, 'submitted');
 
-        if ($vendor->user_id != auth()->id()) {
-            return back()->with('error', 'Unauthorized');
-        }
+        $old = $vendor->status;
+        $vendor->update(['status' => 'submitted']);
+        $this->logStatus($vendor, $old, 'submitted', 'Submitted for review');
 
-        if (!in_array($vendor->status, ['draft', 'sent_back'])) {
-            return back()->with('error', 'Only draft or sent back can be submitted');
-        }
-
-        $oldStatus = $vendor->status;
-
-        $vendor->status = 'submitted';
-        $vendor->save();
-
-        DB::table('vendor_status_logs')->insert([
-            'vendor_id' => $vendor->id,
-            'user_id' => auth()->id(),
-            'from_status' => $oldStatus,
-            'to_status' => 'submitted',
-            'remarks' => 'Submitted by user',
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-
-        return back()->with('success', 'Vendor submitted for approval');
+        return back()->with('success', 'Application submitted for approval.');
     }
 
-    public function approve($id)
-    {
-        $vendor = Vendor::findOrFail($id);
+    // -------------------------------------------------------
+    // Admin actions — approve / reject / send_back
+    // -------------------------------------------------------
 
+    public function approve(Vendor $vendor)
+    {
+        $this->assertAdmin();
+        StatusTransitionService::assertAllowed($vendor->status, 'approved');
+
+        $old = $vendor->status;
+        $vendor->update(['status' => 'approved']);
+        $this->logStatus($vendor, $old, 'approved', 'Approved by admin');
+
+        return back()->with('success', 'Vendor approved.');
+    }
+
+    public function reject(Request $request, Vendor $vendor)
+    {
+        $this->assertAdmin();
+        $request->validate(['remarks' => 'required|string']);
+        StatusTransitionService::assertAllowed($vendor->status, 'rejected');
+
+        $old = $vendor->status;
+        $vendor->update(['status' => 'rejected']);
+        $this->logStatus($vendor, $old, 'rejected', $request->remarks);
+
+        return back()->with('success', 'Vendor rejected.');
+    }
+
+    public function sendBack(Request $request, Vendor $vendor)
+    {
+        $this->assertAdmin();
+        $request->validate(['remarks' => 'required|string']);
+        StatusTransitionService::assertAllowed($vendor->status, 'sent_back');
+
+        $old = $vendor->status;
+        $vendor->update(['status' => 'sent_back']);
+        $this->logStatus($vendor, $old, 'sent_back', $request->remarks);
+
+        return back()->with('success', 'Application sent back for correction.');
+    }
+
+    // -------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------
+
+    private function assertCreator(Vendor $vendor): void
+    {
+        if (auth()->id() !== $vendor->user_id) {
+            abort(403, 'You do not own this application.');
+        }
+    }
+
+    private function assertAdmin(): void
+    {
         if (auth()->user()->role !== 'admin') {
-            return back()->with('error', 'Unauthorized');
+            abort(403, 'Admin access required.');
         }
-
-        $oldStatus = $vendor->status;
-
-        $vendor->status = 'approved';
-        $vendor->save();
-
-        DB::table('vendor_status_logs')->insert([
-            'vendor_id' => $vendor->id,
-            'user_id' => auth()->id(),
-            'from_status' => $oldStatus,
-            'to_status' => 'approved',
-            'remarks' => 'Approved by admin',
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-
-        return back()->with('success', 'Vendor approved');
     }
 
-    public function reject(Request $request, $id)
+    private function assertEditableStatus(Vendor $vendor): void
     {
-        $request->validate([
-            'remarks' => 'required'
-        ]);
-
-        $vendor = Vendor::findOrFail($id);
-
-        $oldStatus = $vendor->status;
-
-        $vendor->status = 'rejected';
-        $vendor->save();
-
-        DB::table('vendor_status_logs')->insert([
-            'vendor_id' => $vendor->id,
-            'user_id' => auth()->id(),
-            'from_status' => $oldStatus,
-            'to_status' => 'rejected',
-            'remarks' => $request->remarks,
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-
-        return back()->with('success', 'Vendor rejected');
+        if (!in_array($vendor->status, ['draft', 'sent_back'])) {
+            abort(403, 'This application can no longer be edited.');
+        }
     }
 
-    public function sendBack(Request $request, $id)
+    private function logStatus(Vendor $vendor, ?string $from, string $to, string $remarks): void
     {
-        $request->validate([
-            'remarks' => 'required'
+        VendorStatusLog::create([
+            'vendor_id'   => $vendor->id,
+            'user_id'     => auth()->id(),
+            'from_status' => $from,
+            'to_status'   => $to,
+            'remarks'     => $remarks,
         ]);
-
-        $vendor = Vendor::findOrFail($id);
-
-        $oldStatus = $vendor->status;
-
-        $vendor->status = 'sent_back';
-        $vendor->save();
-
-        DB::table('vendor_status_logs')->insert([
-            'vendor_id' => $vendor->id,
-            'user_id' => auth()->id(),
-            'from_status' => $oldStatus,
-            'to_status' => 'sent_back',
-            'remarks' => $request->remarks,
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-
-        return back()->with('success', 'Vendor sent back');
     }
 }

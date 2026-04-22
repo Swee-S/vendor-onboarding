@@ -9,24 +9,26 @@ return new class extends Migration
     /**
      * Run the migrations.
      */
-   public function up(): void
+
+public function up(): void
 {
     Schema::create('vendors', function (Blueprint $table) {
         $table->id();
-        $table->string('name');
-        $table->string('email')->unique();
-        $table->string('phone')->nullable();
-        $table->text('address')->nullable();
-        $table->unsignedBigInteger('user_id');
+        $table->foreignId('user_id')->constrained()->onDelete('cascade');
+        $table->string('business_name');
+        $table->string('contact_email');
+        $table->string('contact_mobile', 10);
+        $table->string('address');
+        $table->string('pan_number', 10);
+        $table->string('status')->default('draft');
         $table->timestamps();
     });
 }
-
     /**
      * Reverse the migrations.
      */
-    public function down(): void
-    {
-        Schema::dropIfExists('vendors');
-    }
+   public function down(): void
+{
+    Schema::dropIfExists('vendors');
+}
 };

@@ -9,13 +9,13 @@ return new class extends Migration
     /**
      * Run the migrations.
      */
-  public function up(): void
+public function up(): void
 {
     Schema::create('vendor_status_logs', function (Blueprint $table) {
         $table->id();
-        $table->unsignedBigInteger('vendor_id');
-        $table->unsignedBigInteger('user_id');
-        $table->string('from_status');
+        $table->foreignId('vendor_id')->constrained()->onDelete('cascade');
+        $table->foreignId('user_id')->constrained()->onDelete('cascade');
+        $table->string('from_status')->nullable(); 
         $table->string('to_status');
         $table->text('remarks')->nullable();
         $table->timestamps();
